@@ -1,0 +1,243 @@
+{
+  "id": "conveniosAlDia01",
+  "name": "Convenios al día",
+  "nodes": [
+    {
+      "id": "c0e0c8e2-1b6d-4c1a-9f0e-000000000001",
+      "name": "Probar",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "c0e0c8e2-1b6d-4c1a-9f0e-000000000002",
+      "name": "Cada mañana",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        200
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "30 8 * * 1-6"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "c0e0c8e2-1b6d-4c1a-9f0e-000000000003",
+      "name": "Configuración",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        240,
+        100
+      ],
+      "notes": "Tus convenios: como se nombran en el boletín, sin el número. fecha vacía = hoy. bocm: false si no te interesan los de Madrid.",
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "{\n  \"fecha\": \"\",\n  \"chats_telegram\": [],\n  \"bocm\": true,\n  \"convenios\": [\n    \"industria química\",\n    \"enseñanza privada\"\n  ]\n}",
+        "options": {}
+      }
+    },
+    {
+      "id": "c0e0c8e2-1b6d-4c1a-9f0e-000000000004",
+      "name": "Sumario del BOE",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        100
+      ],
+      "parameters": {
+        "url": "=https://www.boe.es/datosabiertos/api/boe/sumario/{{ $json.fecha || $now.setZone('Europe/Madrid').toFormat('yyyyMMdd') }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "notes": "Los domingos no hay BOE: responde 404 y el flujo para sin enviar nada.",
+      "notesInFlow": true
+    },
+    {
+      "id": "c0e0c8e2-1b6d-4c1a-9f0e-000000000008",
+      "name": "Último BOCM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        100
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput",
+      "notes": "RSS oficial del boletín del día. Si falla, el aviso del BOE sale igual.",
+      "parameters": {
+        "url": "https://www.bocm.es/ultimo-boletin.xml",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "neverError": true
+            }
+          },
+          "timeout": 30000
+        }
+      }
+    },
+    {
+      "id": "c0e0c8e2-1b6d-4c1a-9f0e-000000000005",
+      "name": "Filtrar convenios",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        100
+      ],
+      "notes": "Busca tus convenios en el BOE y en el BOCM. Si hoy no sale ninguno, el flujo para aquí y no envía nada.",
+      "parameters": {
+        "jsCode": "const conf = $('Configuración').first().json;\nconst lista = (x) => (Array.isArray(x) ? x : x ? [x] : []);\nconst norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();\nconst escapar = (s) => s.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');\n// Each name matches at the start of a word and without accents: \"quimica\" finds \"Química\".\nconst convenios = lista(conf.convenios)\n  .filter(Boolean)\n  .map((c) => ({ nombre: c, patron: new RegExp('\\\\b' + escapar(norm(c))) }));\nconst encuentra = (titulo) => convenios.find((x) => x.patron.test(norm(titulo)));\nconst salida = [];\n\n// BOE: state-wide agreements. On Sundays and holidays there is no summary.\nconst boe = $('Sumario del BOE').first().json;\nconst sumario = boe.data && typeof boe.data === 'object' ? boe.data.sumario : null;\nif (sumario) {\n  for (const diario of lista(sumario.diario)) {\n    for (const sec of lista(diario.seccion)) {\n      if (String(sec.codigo) !== '3') continue;\n      for (const dep of lista(sec.departamento)) {\n        for (const ep of lista(dep.epigrafe)) {\n          // Labour agreements only: the plain \"Convenios\" epigraph is agreements between administrations.\n          if (!norm(ep.nombre).startsWith('convenios colectivos')) continue;\n          for (const it of lista(ep.item)) {\n            const c = encuentra(it.titulo);\n            if (!c) continue;\n            salida.push({\n              json: {\n                boletin: 'BOE',\n                fecha: sumario.metadatos.fecha_publicacion,\n                convenio: c.nombre,\n                titulo: it.titulo,\n                identificador: it.identificador,\n                url_html: it.url_html,\n                url_pdf: typeof it.url_pdf === 'object' ? it.url_pdf.texto : it.url_pdf,\n              },\n            });\n          }\n        }\n      }\n    }\n  }\n}\n\n// BOCM: Madrid agreements. Its feed only carries the latest bulletin, so it counts only when that bulletin is the day being checked.\nif (conf.bocm !== false) {\n  const dia = conf.fecha || $now.setZone('Europe/Madrid').toFormat('yyyyMMdd');\n  const rss = String($input.first().json.data || '');\n  const entidades = (s) => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '\"').replace(/&#0?39;/g, \"'\").replace(/&amp;/g, '&');\n  for (const item of rss.match(/<item>[\\s\\S]*?<\\/item>/g) || []) {\n    const link = ((item.match(/<link>([^<]+)<\\/link>/) || [])[1] || '').trim();\n    const m = link.match(/bocm-(\\d{8})-(\\d+)$/);\n    if (!m || m[1] !== dia) continue;\n    // The description is \"<p>Subject<br />– Title</p>\" followed by a fixed footer.\n    const desc = entidades((item.match(/<description>([\\s\\S]*?)<\\/description>/) || [])[1] || '');\n    const texto = desc.split(/\\n\\s*\\n/)[0].replace(/<[^>]+>/g, ' ').replace(/\\s+/g, ' ').trim();\n    if (!/\\bconvenios? colectivos?\\b/.test(norm(texto))) continue;\n    const titulo = texto.includes('–') ? texto.slice(texto.indexOf('–') + 1).trim() : texto;\n    const c = encuentra(titulo);\n    if (!c) continue;\n    const [a, ms, d] = [m[1].slice(0, 4), m[1].slice(4, 6), m[1].slice(6, 8)];\n    salida.push({\n      json: {\n        boletin: 'BOCM',\n        fecha: m[1],\n        convenio: c.nombre,\n        titulo,\n        identificador: `BOCM-${m[1]}-${m[2]}`,\n        url_html: link,\n        url_pdf: `https://www.bocm.es/boletin/CM_Orden_BOCM/${a}/${ms}/${d}/BOCM-${m[1]}-${m[2]}.PDF`,\n      },\n    });\n  }\n}\n// No news in either bulletin: the flow stops here and sends nothing.\nreturn salida;\n"
+      }
+    },
+    {
+      "id": "c0e0c8e2-1b6d-4c1a-9f0e-000000000006",
+      "name": "Preparar aviso",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        100
+      ],
+      "parameters": {
+        "jsCode": "const conf = $('Configuración').first().json;\nconst items = $input.all().map((i) => i.json);\nconst f = items[0].fecha;\nconst fecha = `${f.slice(6, 8)}/${f.slice(4, 6)}/${f.slice(0, 4)}`;\nconst esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;');\nconst norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();\nconst mayus = (s) => s.charAt(0).toUpperCase() + s.slice(1);\n\n// What was published, from the title. A title can name several things: \"Acuerdo de prórroga y aprobación de las tablas salariales\".\n// \"tablas de retribuciones\" and \"tablas económicas\" are salary tables too.\nconst tipos = [\n  [/\\bsentencia\\b/, 'sentencia'],\n  [/\\blaudo\\b/, 'laudo arbitral'],\n  [/\\btablas\\b/, 'tablas salariales'],\n  [/\\brevision salarial\\b|\\bincrementos? salarial(es)?\\b|\\bactualizacion salarial\\b/, 'revisión salarial'],\n  [/\\bprorroga\\b/, 'prórroga'],\n  [/\\bacta de la comision paritaria\\b/, 'acta de la comisión paritaria'],\n  [/\\bmodificacion\\b/, 'modificación'],\n];\n// The title opens with the resolution's own date and office; what is published comes after\n// \"registra y publica\" in the BOE and after \"registro, depósito y publicación\" in the BOCM.\nconst objeto = (titulo) => {\n  const m =\n    titulo.match(/registra y publica (?:el |la |los |las )?(.*)$/i) ||\n    titulo.match(/registro, dep[oó]sito y publicaci[oó]n (?:del |de la |de los |de las |de )?(.*)$/i);\n  const t = (m ? m[1] : titulo).replace(/,\\s*suscrit[oa]s? .*$/i, '').replace(/\\s*\\(C[oó]digo n[uú]mero[^)]*\\)/i, '').trim();\n  return mayus(t.replace(/\\.*$/, '.'));\n};\n// Only a whole agreement is \"new\"; anything else unrecognised is just \"novedad\".\n// A correction says so in the part of the title that objeto() leaves out.\nconst tipo = (titulo) => {\n  const o = norm(objeto(titulo));\n  const t = tipos.filter(([re]) => re.test(o)).map(([, n]) => n);\n  const base = t.length ? t.join(' y ') : /^([ivxlc]+ )?convenio colectivo\\b/.test(o) ? 'convenio nuevo' : 'novedad';\n  return mayus(/\\bcorrigen errores\\b|\\bcorreccion de errores\\b/.test(norm(titulo)) ? `corrección de errores en ${base}` : base);\n};\nconst periodo = (titulo) => {\n  const anos = (objeto(titulo).match(/\\b20\\d\\d\\b/g) || []).map(Number);\n  if (!anos.length) return '';\n  const [a, b] = [Math.min(...anos), Math.max(...anos)];\n  return a === b ? ` ${a}` : ` ${a}–${b}`;\n};\n\nconst asunto = `${fecha}: ${items.length === 1 ? 'novedad en uno de tus convenios' : `${items.length} novedades en tus convenios`}`;\nconst bloque = (d) =>\n  `<b>${esc(mayus(d.convenio))}</b> (${d.boletin}): ${esc(tipo(d.titulo) + periodo(d.titulo))}\\n${esc(objeto(d.titulo))}\\n` +\n  `<a href=\"${esc(d.url_html)}\">Ver en el ${d.boletin}</a>` + (d.url_pdf ? ` | <a href=\"${esc(d.url_pdf)}\">PDF</a>` : '');\n// Telegram caps a message at 4096 characters.\nlet telegram = `<b>${esc(asunto)}</b>`;\nlet n = 0;\nwhile (n < items.length && (telegram + '\\n\\n' + bloque(items[n])).length <= 3800) telegram += '\\n\\n' + bloque(items[n++]);\nif (n < items.length) telegram += `\\n\\n…y ${items.length - n} más.`;\n\nconst texto = items\n  .map((d) => `- ${mayus(d.convenio)} (${d.boletin}): ${tipo(d.titulo)}${periodo(d.titulo)}\\n  ${objeto(d.titulo)}\\n  ${d.url_html}`)\n  .join('\\n');\nconst chats = (Array.isArray(conf.chats_telegram) ? conf.chats_telegram : [conf.chats_telegram]).filter(Boolean);\nif (!chats.length) throw new Error('No hay ningún chat en chats_telegram: pon tu ID de Telegram en Configuración.');\nreturn chats.map((chat) => ({ json: { chat: String(chat), asunto, total: items.length, texto, telegram } }));\n"
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chat }}",
+        "text": "={{ $json.telegram }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML",
+          "disable_web_page_preview": true
+        }
+      },
+      "id": "c0e0c8e2-1b6d-4c1a-9f0e-000000000007",
+      "name": "Enviar a Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1440,
+        100
+      ],
+      "notes": "Un mensaje por cada chat de chats_telegram."
+    }
+  ],
+  "connections": {
+    "Probar": {
+      "main": [
+        [
+          {
+            "node": "Configuración",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cada mañana": {
+      "main": [
+        [
+          {
+            "node": "Configuración",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Configuración": {
+      "main": [
+        [
+          {
+            "node": "Sumario del BOE",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sumario del BOE": {
+      "main": [
+        [
+          {
+            "node": "Último BOCM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filtrar convenios": {
+      "main": [
+        [
+          {
+            "node": "Preparar aviso",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar aviso": {
+      "main": [
+        [
+          {
+            "node": "Enviar a Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Último BOCM": {
+      "main": [
+        [
+          {
+            "node": "Filtrar convenios",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/Madrid"
+  },
+  "active": false,
+  "pinData": {}
+}
